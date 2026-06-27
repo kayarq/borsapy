@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "borsapy"
-version = "0.10.2"
-description = "Turkish financial markets data library - yfinance-like API for BIST stocks, forex, crypto, and more"
+version = "0.10.3+kayarq.1"
+description = "Turkish financial markets data library (kayarq fork) — BIST-first quote contracts, UFRS fallback, statement helpers"
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
@@ -70,10 +70,11 @@ allocation = [
 borsapy = "borsapy.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/saidsurucu/borsapy"
-Documentation = "https://github.com/saidsurucu/borsapy#readme"
-Repository = "https://github.com/saidsurucu/borsapy"
-Issues = "https://github.com/saidsurucu/borsapy/issues"
+Homepage = "https://github.com/kayarq/borsapy"
+Documentation = "https://github.com/kayarq/borsapy#readme"
+Repository = "https://github.com/kayarq/borsapy"
+Issues = "https://github.com/kayarq/borsapy/issues"
+Upstream = "https://github.com/saidsurucu/borsapy"
 
 [tool.hatch.build.targets.wheel]
 packages = ["borsapy"]

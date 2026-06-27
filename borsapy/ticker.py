@@ -110,6 +110,8 @@ class FastInfo:
         "shares",
         "pe_ratio",
         "pb_ratio",
+        "pe_ratio_source",
+        "pb_ratio_source",
         "year_high",
         "year_low",
         "fifty_day_average",
@@ -123,79 +125,106 @@ class FastInfo:
         self._data: dict[str, Any] | None = None
 
     def _load(self) -> dict[str, Any]:
-        """Load all fast info data."""
+        """Load fast info data.
+
+        kayarq: quote fields from TradingView first (cheap). Metrics from İş Yatırım.
+        1y history for 52w/MAs is **lazy** — only if year_* / MA keys are accessed
+        via __getattr__ after initial load (see _ensure_history_metrics).
+        """
         if self._data is not None:
             return self._data
 
-        # Get basic quote info
-        info = self._ticker.info
+        # Prefer cheap TV snapshot over full EnrichedInfo (avoids pulling extended tier)
+        try:
+            quote = self._ticker.quote_snapshot()
+        except Exception:
+            quote = {}
+            try:
+                info = self._ticker.info
+                quote = {
+                    "last": info.get("last"),
+                    "open": info.get("open"),
+                    "high": info.get("high"),
+                    "low": info.get("low"),
+                    "prev_close": info.get("prev_close"),
+                    "volume": info.get("volume"),
+                    "amount": info.get("amount"),
+                }
+            except Exception:
+                pass
 
-        # Get company metrics from İş Yatırım
+        class _Q:
+            def __init__(self, d):
+                self._d = d or {}
+
+            def get(self, k, default=None):
+                return self._d.get(k, default)
+
+        q = _Q(quote)
+
+        metrics: dict[str, Any] = {}
         try:
             metrics = self._ticker._get_isyatirim().get_company_metrics(
                 self._ticker._symbol
-            )
+            ) or {}
         except Exception:
             metrics = {}
 
-        # Calculate 52-week high/low and moving averages from history
-        year_high = None
-        year_low = None
-        fifty_day_avg = None
-        two_hundred_day_avg = None
-
-        try:
-            hist = self._ticker.history(period="1y")
-            if not hist.empty:
-                year_high = float(hist["High"].max())
-                year_low = float(hist["Low"].min())
-                if len(hist) >= 50:
-                    fifty_day_avg = float(hist["Close"].tail(50).mean())
-                if len(hist) >= 200:
-                    two_hundred_day_avg = float(hist["Close"].tail(200).mean())
-        except Exception:
-            pass
-
-        # Calculate shares from market cap and price
         shares = None
-        if metrics.get("market_cap") and info.get("last"):
-            shares = int(metrics["market_cap"] / info["last"])
+        last = q.get("last")
+        if metrics.get("market_cap") and last:
+            try:
+                shares = int(metrics["market_cap"] / last)
+            except (TypeError, ValueError, ZeroDivisionError):
+                shares = None
 
         self._data = {
             "currency": "TRY",
             "exchange": "BIST",
             "timezone": "Europe/Istanbul",
-            "last_price": info.get("last"),
-            "open": info.get("open"),
-            "day_high": info.get("high"),
-            "day_low": info.get("low"),
-            "previous_close": info.get("close"),
-            "volume": info.get("volume"),
-            "amount": info.get("amount"),
+            "last_price": q.get("last"),
+            "open": q.get("open"),
+            "day_high": q.get("high"),
+            "day_low": q.get("low"),
+            "previous_close": self._resolve_previous_close(q),
+            "volume": q.get("volume"),
+            "amount": q.get("amount"),
             "market_cap": metrics.get("market_cap"),
             "shares": shares,
             "pe_ratio": metrics.get("pe_ratio"),
             "pb_ratio": metrics.get("pb_ratio"),
-            "year_high": year_high,
-            "year_low": year_low,
-            "fifty_day_average": round(fifty_day_avg, 2) if fifty_day_avg else None,
-            "two_hundred_day_average": (
-                round(two_hundred_day_avg, 2) if two_hundred_day_avg else None
-            ),
+            "pe_ratio_source": "isyatirim" if metrics.get("pe_ratio") is not None else None,
+            "pb_ratio_source": "isyatirim" if metrics.get("pb_ratio") is not None else None,
+            "year_high": None,
+            "year_low": None,
+            "fifty_day_average": None,
+            "two_hundred_day_average": None,
             "free_float": metrics.get("free_float"),
             "foreign_ratio": metrics.get("foreign_ratio"),
+            "_history_metrics_loaded": False,
         }
 
         return self._data
 
-    def keys(self) -> list[str]:
-        """Return available keys."""
-        return self._KEYS.copy()
-
-    def __getitem__(self, key: str) -> Any:
-        if key not in self._KEYS:
-            raise KeyError(f"Invalid key '{key}'. Valid keys: {self._KEYS}")
-        return self._load().get(key)
+    def _ensure_history_metrics(self) -> None:
+        """Lazy 1y history for 52w high/low and moving averages (kayarq)."""
+        data = self._load()
+        if data.get("_history_metrics_loaded"):
+            return
+        data["_history_metrics_loaded"] = True
+        try:
+            hist = self._ticker.history(period="1y")
+            if hist is not None and not hist.empty:
+                data["year_high"] = float(hist["High"].max())
+                data["year_low"] = float(hist["Low"].min())
+                if len(hist) >= 50:
+                    data["fifty_day_average"] = round(float(hist["Close"].tail(50).mean()), 2)
+                if len(hist) >= 200:
+                    data["two_hundred_day_average"] = round(
+                        float(hist["Close"].tail(200).mean()), 2
+                    )
+        except Exception:
+            pass
 
     def __getattr__(self, name: str) -> Any:
         if name.startswith("_"):
@@ -205,19 +234,67 @@ class FastInfo:
                 f"'{type(self).__name__}' has no attribute '{name}'. "
                 f"Valid attributes: {self._KEYS}"
             )
+        if name in (
+            "year_high",
+            "year_low",
+            "fifty_day_average",
+            "two_hundred_day_average",
+        ):
+            self._ensure_history_metrics()
         return self._load().get(name)
 
+    def _resolve_previous_close(self, info) -> Any:
+        """Prior session close from quote dict, else penultimate history Close."""
+        for key in ("prev_close", "previous_close"):
+            try:
+                val = info.get(key) if hasattr(info, "get") else None
+            except Exception:
+                val = None
+            if val is not None:
+                return val
+        try:
+            hist = self._ticker.history(period="5d")
+            if hist is not None and not hist.empty and "Close" in hist.columns:
+                closes = hist["Close"].dropna()
+                if len(closes) >= 2:
+                    return float(closes.iloc[-2])
+        except Exception:
+            pass
+        return None
+
+    def keys(self) -> list[str]:
+        """Return available keys."""
+        return self._KEYS.copy()
+
+    def __getitem__(self, key: str) -> Any:
+        if key not in self._KEYS:
+            raise KeyError(f"Invalid key '{key}'. Valid keys: {self._KEYS}")
+        if key in (
+            "year_high",
+            "year_low",
+            "fifty_day_average",
+            "two_hundred_day_average",
+        ):
+            self._ensure_history_metrics()
+        return self._load().get(key)
+
     def __iter__(self):
-        return iter(self._load().items())
+        data = self._load()
+        return iter((k, v) for k, v in data.items() if not str(k).startswith("_"))
 
     def __repr__(self) -> str:
         data = self._load()
-        items = [f"{k}={v!r}" for k, v in data.items() if v is not None]
+        items = [
+            f"{k}={v!r}"
+            for k, v in data.items()
+            if v is not None and not str(k).startswith("_")
+        ]
         return f"FastInfo({', '.join(items)})"
 
     def todict(self) -> dict[str, Any]:
-        """Return all data as a dictionary."""
-        return self._load().copy()
+        """Return all data as a dictionary (excludes internal keys)."""
+        data = self._load()
+        return {k: v for k, v in data.items() if not str(k).startswith("_")}
 
 
 class EnrichedInfo:
@@ -257,7 +334,9 @@ class EnrichedInfo:
         "regularMarketOpen": "open",
         "regularMarketDayHigh": "high",
         "regularMarketDayLow": "low",
-        "regularMarketPreviousClose": "close",
+        # Prior session close (TradingView prev_close), NOT ambiguous 'close'
+        "regularMarketPreviousClose": "prev_close",
+        "previousClose": "prev_close",
         "regularMarketVolume": "volume",
         "regularMarketChange": "change",
         "regularMarketChangePercent": "change_percent",
@@ -269,12 +348,17 @@ class EnrichedInfo:
         "open",
         "high",
         "low",
-        "close",
+        "close",  # TV session/field — prefer prev_close for prior day
+        "prev_close",  # prior session reference close (kayarq fork contract)
         "volume",  # Lot bazında hacim
         "amount",  # TL bazında hacim
         "change",
         "change_percent",
         "update_time",
+        "description",
+        "currency",
+        "bid",
+        "ask",
     ]
 
     _EXTENDED_KEYS = [
@@ -1010,6 +1094,41 @@ class Ticker(TechnicalMixin, TwitterMixin):
             financial_group=financial_group,
             last_n=last_n,
         )
+
+    def get_income_stmt_canonical(
+        self,
+        quarterly: bool = True,
+        financial_group: str | None = None,
+        last_n: int | str | None = 4,
+    ) -> pd.DataFrame:
+        """Income statement reduced to revenue / net_income rows (kayarq fork).
+
+        Uses TR label matching (Satış Gelirleri, DÖNEM KARI (ZARARI), …).
+        Auto-retries UFRS for banks when financial_group is None (provider-level).
+        """
+        from borsapy.statements import extract_canonical_lines
+
+        n = 4 if last_n is None else last_n
+        if isinstance(n, str) and n.lower() == "all":
+            n_periods = None
+        else:
+            try:
+                n_periods = int(n)
+            except (TypeError, ValueError):
+                n_periods = 4
+        raw = self.get_income_stmt(
+            quarterly=quarterly,
+            financial_group=financial_group,
+            last_n=last_n,
+        )
+        return extract_canonical_lines(raw, last_n_periods=n_periods)
+
+    def quote_snapshot(self) -> dict[str, Any]:
+        """Cheap BIST quote from TradingView only (no 1y history / İş Yatırım).
+
+        Prefer this in hot MCP paths. Keys: last, prev_close, open, high, low, volume, …
+        """
+        return dict(self._tradingview.get_quote(self._symbol))
 
     def get_cashflow(
         self,

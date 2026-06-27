@@ -591,9 +591,16 @@ class IsYatirimProvider(BaseProvider):
         if cached is not None:
             return cached
 
-        # Determine financial group
+        # Determine financial group(s). Default industrial (XI_29); if caller
+        # did not pin a group, also try bank UFRS when industrial yields nothing
+        # (kayarq fork — GARAN/ISCTR etc. need UFRS).
         if financial_group is None:
-            financial_group = self.FINANCIAL_GROUP_INDUSTRIAL
+            groups_to_try = [
+                self.FINANCIAL_GROUP_INDUSTRIAL,
+                self.FINANCIAL_GROUP_BANK,
+            ]
+        else:
+            groups_to_try = [financial_group]
 
         # Generate all periods needed
         current_year = datetime.now().year
@@ -605,25 +612,35 @@ class IsYatirimProvider(BaseProvider):
             for i in range(0, len(periods), self._MAX_PERIODS_PER_CALL)
         ]
 
-        # Single API call per batch (API returns all tables combined;
-        # we filter by itemCode prefix in _parse_financial_response)
         all_dfs = []
-        for batch_periods in batches:
-            try:
-                df = self._fetch_financial_table(
-                    symbol=symbol,
-                    financial_group=financial_group,
-                    periods=batch_periods,
-                    quarterly=quarterly,
-                    statement_type=statement_type,
-                )
-                if not df.empty:
-                    all_dfs.append(df)
-            except Exception:
-                continue
+        used_group = groups_to_try[0]
+        for group in groups_to_try:
+            group_dfs = []
+            for batch_periods in batches:
+                try:
+                    df = self._fetch_financial_table(
+                        symbol=symbol,
+                        financial_group=group,
+                        periods=batch_periods,
+                        quarterly=quarterly,
+                        statement_type=statement_type,
+                    )
+                    if not df.empty:
+                        group_dfs.append(df)
+                except Exception:
+                    continue
+            if group_dfs:
+                all_dfs = group_dfs
+                used_group = group
+                break
 
         if not all_dfs:
-            raise DataNotAvailableError(f"No financial data available for {symbol}")
+            raise DataNotAvailableError(
+                f"No financial data available for {symbol} "
+                f"(tried financial_group={groups_to_try})"
+            )
+        # Stash for debugging / optional consumers (not part of DataFrame)
+        self._last_financial_group_used = used_group
 
         # Merge batches horizontally (same rows, different period columns)
         result = all_dfs[0]
